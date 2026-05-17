@@ -112,30 +112,30 @@ on_init = function()
 			})
 			request:sleep(5)
 
-			-- action:switch_mode(1)
+			action:switch_mode(1)
 
-			-- local max_retries = 3
-			-- local reloc_ok = false
-			-- for attempt = 1, max_retries do
-			-- 	action:info(string.format(
-			-- 		"[RELOC] 第 %d/%d 次 initial 重定位...", attempt, max_retries))
-			-- 	local ok, st = action:relocalize_initial(0, 0, 0, 20)
-			-- 	if ok then
-			-- 		reloc_ok = true
-			-- 		break
-			-- 	end
-			-- 	action:warn(string.format(
-			-- 		"[RELOC] 第 %d/%d 次失败: %s", attempt, max_retries,
-			-- 		tostring(st and st.message or "unknown")))
-			-- end
+			local max_retries = 3
+			local reloc_ok = false
+			for attempt = 1, max_retries do
+				action:info(string.format(
+					"[RELOC] 第 %d/%d 次 initial 重定位...", attempt, max_retries))
+				local ok, st = action:relocalize_initial(0, 0, 0, 20)
+				if ok then
+					reloc_ok = true
+					break
+				end
+				action:warn(string.format(
+					"[RELOC] 第 %d/%d 次失败: %s", attempt, max_retries,
+					tostring(st and st.message or "unknown")))
+			end
 
-			-- if not reloc_ok then
-			-- 	action:fuck("[RELOC] 3 次 initial 重定位全部失败，取消出区")
-			-- 	return
-			-- end
+			if not reloc_ok then
+				action:fuck("[RELOC] 3 次 initial 重定位全部失败，取消出区")
+				return
+			end
 
-			-- action:info("[ORDER] 重定位成功，启动出区")
-			-- intent_fsm:start_on(Intent.getout)
+			action:info("[ORDER] 重定位成功，启动出区")
+			intent_fsm:start_on(Intent.getout)
 		end)
 
 		while true do

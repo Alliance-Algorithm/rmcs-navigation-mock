@@ -4,7 +4,7 @@ extends Node
 ## 1. 上行：周期性发送机器人位姿/资源状态 (sim.input)
 ## 2. 下行：接收 blackboard、decision_state、nav_target 及各种遥控指令
 ## 3. 超控面板：手动编辑 blackboard 的 HP/Bullet/Stage/Switch 值
-## 4. 自动补给：机器人进入补给区时自动回血/回弹
+## 4. 自动补给：机器人进入补给区时自动回血
 ## 5. 将 Lua 指令转发到 AI 机器人（底盘模式、云台控制、速度超控等）
 
 ## TCP 服务器地址。
@@ -23,8 +23,6 @@ extends Node
 @export var resupply_radius := 0.8
 ## 每秒回复血量。
 @export var resupply_health_rate := 100.0
-## 每秒回复子弹数。
-@export var resupply_bullet_rate := 150.0
 ## 被动金币发放间隔（秒）。
 @export var passive_gold_interval := 30.0
 ## 每次被动发放的金币数量。
@@ -121,8 +119,6 @@ var auto_resupply_active := false
 var resupply_distance: Variant = null
 ## 血量回复累计缓冲区。
 var auto_resupply_health_buffer := 0.0
-## 子弹回复累计缓冲区。
-var auto_resupply_bullet_buffer := 0.0
 ## 距离下一次被动金币发放的剩余时间。
 var passive_gold_left := passive_gold_interval
 ## 是否已从 blackboard 初始化机器人资源。
@@ -288,7 +284,6 @@ func _process(_delta: float) -> void:
 		auto_resupply_active = false
 		resupply_distance = null
 		auto_resupply_health_buffer = 0.0
-		auto_resupply_bullet_buffer = 0.0
 		passive_gold_left = passive_gold_interval
 		robot_resource_initialized = false
 		sim_base_health = initial_base_health
@@ -334,7 +329,6 @@ func _process(_delta: float) -> void:
 			auto_resupply_active = false
 			resupply_distance = null
 			auto_resupply_health_buffer = 0.0
-			auto_resupply_bullet_buffer = 0.0
 			passive_gold_left = passive_gold_interval
 			robot_resource_initialized = false
 			sim_base_health = initial_base_health
@@ -479,6 +473,23 @@ func _handle_message(msg: Dictionary) -> void:
 			_refresh_display()
 		return
 
+	if t == "sim.resource_sync":
+		var user_patch := {
+			"bullet": int(round(_get_numeric_value(msg.get("bullet", 0), 0.0))),
+			"gold": int(round(_get_numeric_value(msg.get("gold", 0), 0.0))),
+		}
+		var patch := {
+			"user": user_patch,
+			"game": {
+				"gold_coin": user_patch["gold"],
+			}
+		}
+		_apply_local_patch(patch)
+		_apply_robot_user_patch(user_patch)
+		_sync_controls_from_blackboard()
+		_refresh_display()
+		return
+
 	# Loot 语义监控快照。
 	if t == "loot.snapshot":
 		var rev := int(msg.get("bb_rev", -1))
@@ -553,6 +564,9 @@ func _handle_message(msg: Dictionary) -> void:
 ## 上行：发送 sim.input，包含机器人位姿和资源状态。
 func _send_input() -> void:
 	var resource := _get_robot_resource_state()
+	var sim_status_payload := {
+		"in_resupply_zone": in_resupply_zone,
+	}
 	var input_payload := {
 		"user": {
 			"x": robot.global_position.z,
@@ -601,6 +615,7 @@ func _send_input() -> void:
 		"meta": {
 			"timestamp": sim_time,
 		},
+		"sim_status": sim_status_payload,
 	}
 
 	_send_json({
@@ -658,7 +673,6 @@ func _set_auto_resupply_override_enabled(enabled: bool) -> void:
 	auto_resupply_override_enabled = enabled
 	if not enabled:
 		auto_resupply_health_buffer = 0.0
-		auto_resupply_bullet_buffer = 0.0
 	_sync_override_mode()
 
 
@@ -793,7 +807,7 @@ func _distance_to_resupply_rect(point: Vector2, rect: Dictionary) -> float:
 	return point.distance_to(Vector2(clamped_x, clamped_y))
 
 
-## 按速率线性推进资源值（血量或子弹），通过 buffer 累积分整数值变化。
+## 按速率线性推进资源值（血量），通过 buffer 累积分整数值变化。
 ## @param current: 当前资源值。
 ## @param target: 目标值。
 ## @param rate: 回复速率 (每秒)。
@@ -836,7 +850,7 @@ func _advance_resupply_resource(
 	return result
 
 
-## 自动补给主逻辑：检测是否进入补给区，按速率回复血量/子弹。
+## 自动补给主逻辑：检测是否进入补给区，按速率回复血量。
 ## 当机器人进入补给区时激活超控，退出时取消超控。
 func _update_auto_resupply(delta: float) -> void:
 	var previous_in_zone := in_resupply_zone
@@ -875,8 +889,7 @@ func _update_auto_resupply(delta: float) -> void:
 
 	# 读取期望回复的目标值。
 	var target_health := _get_positive_target_value("rule", "health_ready")
-	var target_bullet := _get_positive_target_value("rule", "bullet_ready")
-	auto_resupply_active = in_resupply_zone and (target_health > 0 or target_bullet > 0)
+	auto_resupply_active = in_resupply_zone and target_health > 0
 	_set_auto_resupply_override_enabled(auto_resupply_active)
 
 	if not auto_resupply_active:
@@ -902,22 +915,6 @@ func _update_auto_resupply(delta: float) -> void:
 			patch_user["health"] = int(health_result.get("next_value", current_health))
 	else:
 		auto_resupply_health_buffer = 0.0
-
-	# 按速率回复子弹。
-	if target_bullet > 0:
-		var current_bullet := int(round(_get_numeric_value(user.get("bullet", 0), 0.0)))
-		var bullet_result := _advance_resupply_resource(
-			current_bullet,
-			target_bullet,
-			resupply_bullet_rate,
-			delta,
-			auto_resupply_bullet_buffer
-		)
-		auto_resupply_bullet_buffer = float(bullet_result.get("buffer", 0.0))
-		if bool(bullet_result.get("changed", false)):
-			patch_user["bullet"] = int(bullet_result.get("next_value", current_bullet))
-	else:
-		auto_resupply_bullet_buffer = 0.0
 
 	if patch_user.is_empty():
 		if previous_in_zone != in_resupply_zone or previous_active != auto_resupply_active:

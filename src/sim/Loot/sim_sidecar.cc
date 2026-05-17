@@ -514,6 +514,21 @@ struct OverrideState {
     std::optional<YAML::Node> patch; ///< 状态补丁配置
 };
 
+struct SimStatus {
+    bool in_resupply_zone = false;
+};
+
+struct ExchangeRuntimeState {
+    std::optional<double> user_bullet;
+    std::optional<double> user_gold;
+    std::optional<double> game_gold_coin;
+    std::optional<double> exchangeable_ammunition_quantity;
+    std::optional<double> exchanged_bullet;
+    std::optional<double> remote_bullet_exchange_count;
+    bool initialized = false;
+    bool pending_sync = false;
+};
+
 enum class RelocalizeStateCode : int {
     Idle = 0,
     InFlight = 1,
@@ -574,6 +589,8 @@ private:
     bool closed = false;                                             ///< 运行时是否已关闭
     HostCommandState command_state;                                  ///< 宿主命令态
     RelocalizeRuntimeState relocalize_state;                         ///< 重定位可视态
+    ExchangeRuntimeState exchange_state;                             ///< 仿真换弹状态
+    SimStatus sim_status;                                            ///< Godot 仿真状态
 
     /**
      * @brief 解包Lua函数调用结果
@@ -633,6 +650,111 @@ private:
                 {"relocalize_fitness_score", relocalize_state.fitness_score},
                 {"relocalize_confidence", relocalize_state.confidence},
             });
+    }
+
+    auto emit_sim_resource_sync() -> void {
+        emit(
+            JsonFields{
+                {"type", std::string{"sim.resource_sync"}},
+                {"bullet", optional_or_zero(exchange_state.user_bullet)},
+                {"gold", optional_or_zero(exchange_state.user_gold)},
+            });
+    }
+
+    auto sync_exchange_state_from_blackboard() -> void {
+        auto user = blackboard["user"].get<sol::table>();
+        auto game = blackboard["game"].get<sol::table>();
+
+        auto assign_number =
+            [](const sol::table& table, const char* key, std::optional<double>& target) -> void {
+                auto value = table[key].get_or(sol::object{});
+                if (!value.valid() || value == sol::lua_nil || !value.is<double>()) {
+                    return;
+                }
+                target = value.as<double>();
+            };
+
+        assign_number(user, "bullet", exchange_state.user_bullet);
+        assign_number(user, "gold", exchange_state.user_gold);
+        assign_number(game, "gold_coin", exchange_state.game_gold_coin);
+        assign_number(
+            game, "exchangeable_ammunition_quantity",
+            exchange_state.exchangeable_ammunition_quantity);
+        assign_number(game, "exchanged_bullet", exchange_state.exchanged_bullet);
+        assign_number(
+            game, "remote_bullet_exchange_count", exchange_state.remote_bullet_exchange_count);
+        exchange_state.initialized = true;
+    }
+
+    auto apply_exchange_state_to_blackboard() -> void {
+        if (!exchange_state.initialized) {
+            return;
+        }
+
+        auto user = blackboard["user"].get<sol::table>();
+        auto game = blackboard["game"].get<sol::table>();
+
+        if (exchange_state.user_bullet) {
+            user["bullet"] = *exchange_state.user_bullet;
+        }
+        if (exchange_state.user_gold) {
+            user["gold"] = *exchange_state.user_gold;
+        }
+        if (exchange_state.game_gold_coin) {
+            game["gold_coin"] = *exchange_state.game_gold_coin;
+        }
+        if (exchange_state.exchangeable_ammunition_quantity) {
+            game["exchangeable_ammunition_quantity"] =
+                *exchange_state.exchangeable_ammunition_quantity;
+        }
+        if (exchange_state.exchanged_bullet) {
+            game["exchanged_bullet"] = *exchange_state.exchanged_bullet;
+        }
+        if (exchange_state.remote_bullet_exchange_count) {
+            game["remote_bullet_exchange_count"] = *exchange_state.remote_bullet_exchange_count;
+        }
+    }
+
+    auto clear_exchange_pending_sync_if_matched() -> void {
+        if (!exchange_state.pending_sync) {
+            return;
+        }
+
+        auto user = blackboard["user"].get<sol::table>();
+        auto game = blackboard["game"].get<sol::table>();
+        const auto current_bullet = user["bullet"].get_or(0.0);
+        const auto current_gold = user["gold"].get_or(0.0);
+        const auto current_gold_coin = game["gold_coin"].get_or(0.0);
+        const auto current_bank = game["exchangeable_ammunition_quantity"].get_or(0.0);
+        const auto current_exchanged = game["exchanged_bullet"].get_or(0.0);
+        const auto current_remote_count = game["remote_bullet_exchange_count"].get_or(0.0);
+
+        if (exchange_state.user_bullet && current_bullet != *exchange_state.user_bullet) {
+            return;
+        }
+        if (exchange_state.user_gold && current_gold != *exchange_state.user_gold) {
+            return;
+        }
+        if (exchange_state.game_gold_coin && current_gold_coin != *exchange_state.game_gold_coin) {
+            return;
+        }
+        if (exchange_state.exchangeable_ammunition_quantity
+            && current_bank != *exchange_state.exchangeable_ammunition_quantity) {
+            return;
+        }
+        if (exchange_state.exchanged_bullet && current_exchanged != *exchange_state.exchanged_bullet) {
+            return;
+        }
+        if (exchange_state.remote_bullet_exchange_count
+            && current_remote_count != *exchange_state.remote_bullet_exchange_count) {
+            return;
+        }
+
+        exchange_state.pending_sync = false;
+    }
+
+    [[nodiscard]] auto optional_or_zero(const std::optional<double>& value) const -> double {
+        return value.value_or(0.0);
     }
 
     auto mark_relocalize_success(std::string_view mode, double x, double y) -> bool {
@@ -954,9 +1076,104 @@ private:
                 "estimated_qw", relocalize_state.estimated_qw);
         });
         api.set_function("exchange_17mm_bullet", [this](int amount) {
-            auto game = blackboard["game"].get<sol::table>();
-            game["exchanged_bullet"] = amount;
-            emit_log(LogLevel::Info, std::format("exchange_17mm_bullet simulated: {}", amount));
+            sync_exchange_state_from_blackboard();
+
+            constexpr int kBatchSize = 100;
+            constexpr int kResupplyCostPerBatch = 100;
+            constexpr int kRemoteCostPerBatch = 150;
+
+            const int current_exchanged =
+                static_cast<int>(std::lround(optional_or_zero(exchange_state.exchanged_bullet)));
+            if (amount <= 0) {
+                exchange_state.exchanged_bullet = 0.0;
+                apply_exchange_state_to_blackboard();
+                emit_log(LogLevel::Info, "exchange_17mm_bullet canceled");
+                return;
+            }
+
+            const int delta = amount - current_exchanged;
+            if (delta <= 0) {
+                exchange_state.exchanged_bullet = static_cast<double>(amount);
+                apply_exchange_state_to_blackboard();
+                emit_log(
+                    LogLevel::Info,
+                    std::format(
+                        "exchange_17mm_bullet accepted existing target: current={} requested={}",
+                        current_exchanged, amount));
+                return;
+            }
+
+            if (delta % kBatchSize != 0) {
+                emit_log(
+                    LogLevel::Warn,
+                    std::format(
+                        "exchange_17mm_bullet rejected: delta {} is not multiple of {}",
+                        delta, kBatchSize));
+                return;
+            }
+
+            const int batch_count = delta / kBatchSize;
+            const bool in_resupply_zone = sim_status.in_resupply_zone;
+            const int cost_per_batch =
+                in_resupply_zone ? kResupplyCostPerBatch : kRemoteCostPerBatch;
+            const int total_cost = batch_count * cost_per_batch;
+
+            const int current_bullet =
+                static_cast<int>(std::lround(optional_or_zero(exchange_state.user_bullet)));
+            const int current_gold =
+                static_cast<int>(std::lround(optional_or_zero(exchange_state.user_gold)));
+            const int current_gold_coin =
+                static_cast<int>(std::lround(optional_or_zero(exchange_state.game_gold_coin)));
+            const int current_ammo_bank = static_cast<int>(std::lround(
+                optional_or_zero(exchange_state.exchangeable_ammunition_quantity)));
+            const int current_remote_count = static_cast<int>(std::lround(
+                optional_or_zero(exchange_state.remote_bullet_exchange_count)));
+
+            if (current_gold < total_cost || current_gold_coin < total_cost) {
+                emit_log(
+                    LogLevel::Warn,
+                    std::format(
+                        "exchange_17mm_bullet rejected: insufficient gold (user={}, game={}, cost={})",
+                        current_gold, current_gold_coin, total_cost));
+                return;
+            }
+
+            if (current_ammo_bank < delta) {
+                emit_log(
+                    LogLevel::Warn,
+                    std::format(
+                        "exchange_17mm_bullet rejected: insufficient ammo bank (bank={}, need={})",
+                        current_ammo_bank, delta));
+                return;
+            }
+
+            exchange_state.user_bullet = static_cast<double>(current_bullet + delta);
+            exchange_state.user_gold = static_cast<double>(current_gold - total_cost);
+            exchange_state.game_gold_coin = static_cast<double>(current_gold_coin - total_cost);
+            exchange_state.exchangeable_ammunition_quantity =
+                static_cast<double>(current_ammo_bank - delta);
+            exchange_state.exchanged_bullet = static_cast<double>(amount);
+            if (in_resupply_zone) {
+                exchange_state.remote_bullet_exchange_count = static_cast<double>(current_remote_count);
+            } else {
+                exchange_state.remote_bullet_exchange_count =
+                    static_cast<double>(current_remote_count + batch_count);
+            }
+            exchange_state.pending_sync = true;
+            apply_exchange_state_to_blackboard();
+            emit_sim_resource_sync();
+
+            emit_log(
+                LogLevel::Info,
+                std::format(
+                    "exchange_17mm_bullet simulated: requested={} delta={} zone={} cost={} bullet={} gold={} bank={} remote_count={}",
+                    amount, delta, in_resupply_zone ? "resupply" : "remote", total_cost,
+                    static_cast<int>(std::lround(optional_or_zero(exchange_state.user_bullet))),
+                    static_cast<int>(std::lround(optional_or_zero(exchange_state.user_gold))),
+                    static_cast<int>(std::lround(
+                        optional_or_zero(exchange_state.exchangeable_ammunition_quantity))),
+                    static_cast<int>(std::lround(
+                        optional_or_zero(exchange_state.remote_bullet_exchange_count)))));
         });
         api.set_function("switch_mode", [this](int mode) {
             auto game = blackboard["game"].get<sol::table>();
@@ -1199,6 +1416,32 @@ public:
 
         auto meta = blackboard["meta"].get<sol::table>();
         meta["timestamp"] = state.meta.timestamp;
+
+        sync_exchange_state_from_blackboard();
+        clear_exchange_pending_sync_if_matched();
+        if (!exchange_state.pending_sync) {
+            if (state.user.bullet) {
+                exchange_state.user_bullet = *state.user.bullet;
+            }
+            if (state.user.gold) {
+                exchange_state.user_gold = *state.user.gold;
+            }
+            if (state.game.gold_coin) {
+                exchange_state.game_gold_coin = *state.game.gold_coin;
+            }
+            if (state.game.exchangeable_ammunition_quantity) {
+                exchange_state.exchangeable_ammunition_quantity =
+                    *state.game.exchangeable_ammunition_quantity;
+            }
+            if (state.game.exchanged_bullet) {
+                exchange_state.exchanged_bullet = *state.game.exchanged_bullet;
+            }
+            if (state.game.remote_bullet_exchange_count) {
+                exchange_state.remote_bullet_exchange_count =
+                    *state.game.remote_bullet_exchange_count;
+            }
+        }
+        apply_exchange_state_to_blackboard();
     }
 
     /**
@@ -1212,6 +1455,7 @@ public:
 
     auto apply_override_patch(const YAML::Node& patch) -> void {
         apply_table_patch(blackboard, patch);
+        sync_exchange_state_from_blackboard();
     }
 
     /**
@@ -1288,6 +1532,8 @@ public:
     auto feed_control(double vx, double vy, double qx) -> void {
         unwrap_result(on_control(vx, vy, qx), "lua on_control failed");
     }
+
+    auto update_sim_status(const SimStatus& status) -> void { sim_status = status; }
 
     /**
      * @brief 调用仿真目标设置函数
@@ -1523,6 +1769,11 @@ auto update_state_from_payload(const YAML::Node& root, SimState& state) -> void 
         if (game["exchanged_bullet"] && !game["exchanged_bullet"].IsNull()) {
             state.game.exchanged_bullet = parse_double(game["exchanged_bullet"]);
         }
+        if (game["remote_bullet_exchange_count"]
+            && !game["remote_bullet_exchange_count"].IsNull()) {
+            state.game.remote_bullet_exchange_count =
+                parse_double(game["remote_bullet_exchange_count"]);
+        }
         if (game["sentry_mode"] && !game["sentry_mode"].IsNull()) {
             state.game.sentry_mode = parse_double(game["sentry_mode"]);
         }
@@ -1582,6 +1833,9 @@ auto update_state_from_payload(const YAML::Node& root, SimState& state) -> void 
         if (user["bullet"]) {
             filtered_user["bullet"] = user["bullet"];
         }
+        if (user["gold"]) {
+            filtered_user["gold"] = user["gold"];
+        }
         if (has_entries(filtered_user)) {
             result["user"] = filtered_user;
         }
@@ -1604,6 +1858,15 @@ auto update_state_from_payload(const YAML::Node& root, SimState& state) -> void 
         if (game["small_energy_mechanism_activated"])
             filtered_game["small_energy_mechanism_activated"] =
                 game["small_energy_mechanism_activated"];
+        if (game["gold_coin"])
+            filtered_game["gold_coin"] = game["gold_coin"];
+        if (game["exchangeable_ammunition_quantity"])
+            filtered_game["exchangeable_ammunition_quantity"] =
+                game["exchangeable_ammunition_quantity"];
+        if (game["exchanged_bullet"])
+            filtered_game["exchanged_bullet"] = game["exchanged_bullet"];
+        if (game["remote_bullet_exchange_count"])
+            filtered_game["remote_bullet_exchange_count"] = game["remote_bullet_exchange_count"];
         if (has_entries(filtered_game))
             result["game"] = filtered_game;
     }
@@ -1685,6 +1948,7 @@ auto update_state_from_payload(const YAML::Node& root, SimState& state) -> void 
 struct ClientRuntime {
     SimState state;
     OverrideState override_state;
+    SimStatus sim_status;
     bool has_input = false;
     bool has_initial_remaining_time = false;
     bool waiting_for_initial_remaining_time_logged = false;
@@ -1728,6 +1992,11 @@ auto process_message(
         }
 
         update_state_from_payload(payload, context.state);
+        auto sim_status = payload["sim_status"];
+        if (sim_status && sim_status.IsMap()) {
+            context.sim_status.in_resupply_zone =
+                parse_boolean(sim_status["in_resupply_zone"], false);
+        }
         if (context.state.game.remaining_time.has_value()) {
             context.has_initial_remaining_time = true;
             context.waiting_for_initial_remaining_time_logged = false;
@@ -1975,6 +2244,7 @@ auto handle_client(const Args& args, int client_fd) -> void {
             logger(LogLevel::Info, "input stream resumed");
         }
 
+        runtime.update_sim_status(context.sim_status);
         runtime.apply_state(context.state);
         if (context.override_state.enabled && context.override_state.patch
             && context.override_state.patch->IsMap()) {
